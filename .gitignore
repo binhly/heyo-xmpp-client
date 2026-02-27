@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Bundler
+/.bundle/
+/vendor/bundle/
+/Gemfile.lock
+
+# Gem build artifacts
+/*.gem
+/pkg/
+
+# Test and coverage outputs
+/coverage/
+/tmp/
+/log/
+
+# Tooling/editor
+.byebug_history
+.rspec_status

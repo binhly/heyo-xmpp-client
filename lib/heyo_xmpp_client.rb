@@ -7,6 +7,7 @@ require_relative "xmpp/plugin_manager"
 require_relative "xmpp/client"
 require_relative "xmpp/plugins/mod_inbox"
 require_relative "xmpp/plugins/token_reconnection"
+require_relative "xmpp/plugins/muc_light"
 
 module HeyoXmppClient
 end

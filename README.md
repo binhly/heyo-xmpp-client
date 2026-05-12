@@ -6,6 +6,7 @@ Lightweight XMPP client for Ruby with:
 - Built-in plugins:
   - `Xmpp::Plugins::ModInbox`
   - `Xmpp::Plugins::TokenReconnection`
+  - `Xmpp::Plugins::MucLight` — MongooseIM [MUC Light](https://mongooseim-global-distrib.readthedocs.io/en/latest/open-extensions/muc_light/) group chat
 
 ## Installation
 
@@ -48,6 +49,27 @@ client.connect
 client.send_presence(status: "Online")
 client.disconnect
 ```
+
+## MUC Light (MongooseIM)
+
+```ruby
+muc = client.use(Xmpp::Plugins::MucLight)
+
+muc.on_message            { |evt| puts "#{evt[:from]}: #{evt[:body]}" }
+muc.on_affiliation_change { |evt| puts "affiliations: #{evt[:users]}" }
+muc.on_room_destroyed     { |evt| puts "destroyed: #{evt[:room_jid]}" }
+
+room = muc.create_room(name: "Devs", occupants: ["alice@example.com"])
+muc.send_groupchat_message(room[:room_jid], "Hello, room!")
+muc.invite(room[:room_jid], "bob@example.com")
+muc.set_configuration(room[:room_jid], subject: "Daily standup")
+muc.rooms                       # => list of rooms the user is in
+muc.kick(room[:room_jid], "alice@example.com")
+muc.leave(room[:room_jid])
+```
+
+The service host defaults to `muclight.<your-domain>`. Override with
+`client.use(Xmpp::Plugins::MucLight, service_host: "groups.example.com")`.
 
 ## Rails integration pattern
 

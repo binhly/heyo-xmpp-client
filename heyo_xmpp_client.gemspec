@@ -7,7 +7,7 @@ Gem::Specification.new do |spec|
   spec.email = ["binh@hey.com"]
 
   spec.summary = "Simple XMPP client with plugin support."
-  spec.description = "A lightweight XMPP client with reconnection support and pluggable features such as mod_inbox and token-based auth."
+  spec.description = "A lightweight XMPP client with reconnection support and pluggable features such as mod_inbox, token-based auth, MUC Light, and PubSub."
   spec.homepage = "https://github.com/binhly/heyo_xmpp_client"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.0"

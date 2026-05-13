@@ -7,6 +7,7 @@ Lightweight XMPP client for Ruby with:
   - `Xmpp::Plugins::ModInbox`
   - `Xmpp::Plugins::TokenReconnection`
   - `Xmpp::Plugins::MucLight` — MongooseIM [MUC Light](https://mongooseim-global-distrib.readthedocs.io/en/latest/open-extensions/muc_light/) group chat
+  - `Xmpp::Plugins::Pubsub` — MongooseIM [mod_pubsub](https://esl.github.io/MongooseDocs/latest/modules/mod_pubsub/) (XEP-0060)
 
 ## Installation
 
@@ -70,6 +71,30 @@ muc.leave(room[:room_jid])
 
 The service host defaults to `muclight.<your-domain>`. Override with
 `client.use(Xmpp::Plugins::MucLight, service_host: "groups.example.com")`.
+
+## PubSub (MongooseIM)
+
+```ruby
+ps = client.use(Xmpp::Plugins::Pubsub)
+
+ps.on_item_published   { |evt| puts "#{evt[:node]} #{evt[:item_id]}: #{evt[:payload_xml]}" }
+ps.on_item_retracted   { |evt| puts "retracted #{evt[:item_id]} from #{evt[:node]}" }
+ps.on_node_deleted     { |evt| puts "deleted node #{evt[:node]}" }
+ps.on_subscription_change { |evt| puts "sub #{evt[:node]} -> #{evt[:subscription]}" }
+
+ps.create_node("blog")
+ps.subscribe("blog")
+ps.publish("blog", "<entry xmlns='http://www.w3.org/2005/Atom'><title>Hi</title></entry>")
+ps.items("blog")               # => [{ id:, publisher:, payload_xml: }, ...]
+ps.subscriptions               # requester-scoped
+ps.affiliations(node: "blog")  # node-scoped (owner)
+ps.set_affiliations("blog", changes: [{ jid: "bob@example.com", affiliation: "publisher" }])
+ps.unsubscribe("blog")
+ps.delete_node("blog")
+```
+
+The service host defaults to `pubsub.<your-domain>`. Override with
+`client.use(Xmpp::Plugins::Pubsub, service_host: "ps.example.com")`.
 
 ## Rails integration pattern
 

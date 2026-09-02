@@ -51,6 +51,28 @@ client.send_presence(status: "Online")
 client.disconnect
 ```
 
+### Client options
+
+`Xmpp::Client.new` accepts these optional keyword arguments:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `host` | the JID domain | Server host to connect to |
+| `port` | `5222` | Server port |
+| `use_tls` | `:starttls` | `:starttls`, `:always`, or `nil` |
+| `resource` | `"ruby"` | Resource used when binding |
+| `reconnect` | `true` | Automatically reconnect after unexpected drops |
+| `reconnect_max_attempts` | `nil` | Maximum reconnects before raising (`nil` = unlimited) |
+| `reconnect_base_interval` | `1` | Initial backoff in seconds |
+| `reconnect_max_interval` | `30` | Backoff cap in seconds |
+| `ping_interval` | `60` | Seconds between XMPP pings (`0` disables) |
+| `connect_timeout` | `10` | Seconds allowed for TCP/TLS connect |
+| `read_timeout` | `30` | Seconds allowed while waiting for a stanza/IQ response |
+
+If no response arrives within `read_timeout`, a `Xmpp::Client::TimeoutError` is
+raised instead of blocking forever. The JID may include a resource
+(`"user@domain/resource"`); it is stripped for the connection and binding.
+
 ## MUC Light (MongooseIM)
 
 ```ruby

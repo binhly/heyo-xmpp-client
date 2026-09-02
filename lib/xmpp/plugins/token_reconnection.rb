@@ -43,7 +43,7 @@ module Xmpp
         id = @client.next_iq_id("token")
         xml = "<iq type='get' to='#{escape_attr(bare_jid)}' id='#{escape_attr(id)}'><query xmlns='#{TokenNamespace}'/></iq>"
         iq = @client.request_iq(id: id, xml: xml, allow_reconnect: true)
-        raise_token_error(iq) if iq.attributes["type"] == "error"
+        raise_iq_error(iq, "Token request error") if iq.attributes["type"] == "error"
         items = child_by_name(iq, "items")
         raise "Token response missing <items>" unless items
         @access_token = child_text(items, "access_token")
@@ -67,7 +67,7 @@ module Xmpp
       private
 
       def bare_jid
-        @client.jid
+        @client.respond_to?(:bare_jid) ? @client.bare_jid : @client.jid.to_s.split("/", 2).first
       end
 
       def features_supports_xoauth?(features)
@@ -106,11 +106,6 @@ module Xmpp
 
       def token_present?(token)
         token && !token.to_s.strip.empty?
-      end
-
-      def raise_token_error(iq)
-        error_text = iq.elements["error"]&.elements["text"]&.text
-        raise(error_text || "Token request error")
       end
     end
   end

@@ -189,7 +189,7 @@ module Xmpp
       def on_stanza(stanza)
         return unless stanza.name == "message"
         event_el = child_by_name(stanza, "event")
-        return unless event_el && event_el.attributes["xmlns"] == EventNs
+        return unless event_el && namespaced?(event_el, EventNs)
 
         service = stanza.attributes["from"]
         items_el  = child_by_name(event_el, "items")
@@ -243,13 +243,8 @@ module Xmpp
         id = @client.next_iq_id(id_prefix)
         xml = "<iq type='#{type}' id='#{escape_attr(id)}' to='#{escape_attr(target)}'>#{body_xml}</iq>"
         iq = @client.request_iq(id: id, xml: xml, allow_reconnect: true)
-        raise_pubsub_error(iq) if iq.attributes["type"] == "error"
+        raise_iq_error(iq, "PubSub request error") if iq.attributes["type"] == "error"
         iq
-      end
-
-      def raise_pubsub_error(iq)
-        error_text = iq.elements["error"]&.elements["text"]&.text
-        raise(error_text || "PubSub request error")
       end
 
       def inner_xml(element)
@@ -345,12 +340,7 @@ module Xmpp
       end
 
       def emit(event, payload)
-        @callbacks[event].each do |cb|
-          begin
-            cb.call(payload)
-          rescue StandardError
-          end
-        end
+        emit_callbacks(@callbacks, event, payload)
       end
     end
   end

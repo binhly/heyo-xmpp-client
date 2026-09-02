@@ -5,15 +5,48 @@ require "thread"
 class XmppStreamParser
   Event = Struct.new(:type, :element, :error)
 
+  # A thread-safe FIFO that supports blocking pop with a timeout so the
+  # client can bound how long it waits on the reading thread.
+  class TimedQueue
+    def initialize
+      @mutex = Mutex.new
+      @cond = ConditionVariable.new
+      @items = []
+    end
+
+    def push(item)
+      @mutex.synchronize do
+        @items << item
+        @cond.signal
+      end
+    end
+    alias << push
+
+    # Returns the next item, or nil when +timeout+ seconds elapse with no
+    # item available. A nil +timeout+ (or Infinity) blocks indefinitely.
+    def pop_with_timeout(timeout)
+      @mutex.synchronize do
+        if @items.empty?
+          return nil if timeout && timeout <= 0
+          @cond.wait(@mutex, timeout)
+          return nil if @items.empty?
+        end
+        @items.shift
+      end
+    end
+  end
+
   def initialize(io, logger: nil)
     @io = io
-    @queue = Queue.new
+    @queue = TimedQueue.new
     @logger = logger
     @thread = Thread.new { run }
   end
 
-  def next_event
-    @queue.pop
+  # Yields the next parse event. When +timeout+ (seconds) is given and
+  # elapses before an event arrives, returns nil instead of blocking forever.
+  def next_event(timeout: nil)
+    @queue.pop_with_timeout(timeout)
   end
 
   def stop

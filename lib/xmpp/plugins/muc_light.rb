@@ -169,7 +169,7 @@ module Xmpp
         id = @client.next_iq_id(id_prefix)
         xml = "<iq type='#{type}' id='#{escape_attr(id)}' to='#{escape_attr(target)}'>#{body_xml}</iq>"
         iq = @client.request_iq(id: id, xml: xml, allow_reconnect: true)
-        raise_muc_light_error(iq) if iq.attributes["type"] == "error"
+        raise_iq_error(iq, "MUC Light request error") if iq.attributes["type"] == "error"
         iq
       end
 
@@ -272,7 +272,7 @@ module Xmpp
 
       def find_x(message, namespace)
         message.elements.each("x") do |x|
-          return x if x.attributes["xmlns"] == namespace
+          return x if namespaced?(x, namespace)
         end
         nil
       end
@@ -318,19 +318,7 @@ module Xmpp
       end
 
       def emit(event, payload)
-        @callbacks[event].each do |cb|
-          begin
-            cb.call(payload)
-          rescue StandardError
-            # per-callback isolation: a misbehaving listener must not
-            # stop sibling listeners or the parser thread.
-          end
-        end
-      end
-
-      def raise_muc_light_error(iq)
-        error_text = iq.elements["error"]&.elements["text"]&.text
-        raise(error_text || "MUC Light request error")
+        emit_callbacks(@callbacks, event, payload)
       end
     end
   end

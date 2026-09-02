@@ -4,6 +4,7 @@ require "base64"
 require "rexml/document"
 require "thread"
 require "securerandom"
+require "timeout"
 
 require_relative "stream_parser"
 require_relative "plugin_manager"
@@ -13,11 +14,16 @@ module Xmpp
   class Client
     include Xmpp::XmlHelpers
 
+    # Raised when a bounded wait (connect / IQ / element / read) times out
+    # instead of blocking forever.
+    class TimeoutError < StandardError; end
+
     StreamHeader = %(<?xml version='1.0'?>\n<stream:stream to='%{domain}' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>)
 
     def initialize(jid:, password:, host: nil, port: 5222, use_tls: :starttls, resource: "ruby", logger: nil,
                    reconnect: true, reconnect_max_attempts: nil, reconnect_base_interval: 1,
-                   reconnect_max_interval: 30, ping_interval: 60)
+                   reconnect_max_interval: 30, ping_interval: 60,
+                   connect_timeout: 10, read_timeout: 30)
       @jid = jid
       @password = password
       @host = host
@@ -33,16 +39,22 @@ module Xmpp
       @reconnect_max_interval = reconnect_max_interval
       @ping_interval = ping_interval
       @ping_thread = nil
+      @ping_cond = nil
+      @ping_mutex = nil
       @stop_ping = false
+      @connect_timeout = connect_timeout
+      @read_timeout = read_timeout
       @reconnect_mutex = Mutex.new
-      @domain, @username = parse_jid(jid)
+      @write_mutex = Mutex.new
+      @domain, @user = parse_jid(jid)
+      @bare_jid = "#{@user}@#{@domain}"
       @full_jid = nil
       @last_stream_features = nil
       @connected = false
       @plugin_manager = Xmpp::PluginManager.new(logger: @logger)
     end
 
-    attr_reader :full_jid, :jid
+    attr_reader :full_jid, :jid, :bare_jid
 
     def connect
       connect_once
@@ -86,9 +98,9 @@ module Xmpp
       send_raw(stanza)
     end
 
-    def request_iq(id:, xml:, allow_reconnect: true)
+    def request_iq(id:, xml:, allow_reconnect: true, timeout: @read_timeout)
       send_raw(xml)
-      wait_for_iq(id, allow_reconnect: allow_reconnect)
+      wait_for_iq(id, allow_reconnect: allow_reconnect, timeout: timeout)
     end
 
     def next_iq_id(prefix)
@@ -151,7 +163,7 @@ module Xmpp
       ssl = OpenSSL::SSL::SSLSocket.new(@socket, ctx)
       ssl.hostname = @host || @domain # SNI
       ssl.sync_close = true
-      ssl.connect
+      Timeout.timeout(@connect_timeout) { ssl.connect }
       @socket = ssl
       log("TLS negotiation successful")
     end
@@ -159,9 +171,27 @@ module Xmpp
     def authenticate
       plugin_result = @plugin_manager.sasl_authenticate(self, @last_stream_features)
       return if plugin_result == true
-      auth = Base64.strict_encode64("\0#{@username}\0#{@password}")
+      # A plugin returned false because a token attempt failed (e.g. expired).
+      # Do NOT silently fall back to PLAIN over the same stream: the SASL
+      # exchange for the token was already consumed and most servers close the
+      # stream on auth failure. Reconnect so the stream is renegotiated fresh.
+      if plugin_result == false
+        reconnect_for_auth_retry
+        return
+      end
+      auth = Base64.strict_encode64("\0#{@user}\0#{@password}")
       response = sasl_authenticate(mechanism: "PLAIN", payload: auth)
       raise "SASL authentication failed" if response.name == "failure"
+    end
+
+    def reconnect_for_auth_retry
+      log("Token auth rejected; restarting stream for PLAIN retry")
+      # Re-establish only the transport and the pre-auth stream. The caller
+      # (connect_once) continues with the post-auth stream and bind/session, so
+      # it must NOT do a full connect_once here (that would re-bind/re-session).
+      cleanup_connection
+      open_transport
+      open_and_negotiate_stream
     end
 
     def bind_resource
@@ -180,35 +210,34 @@ module Xmpp
 
     def connect_once
       cleanup_connection
-      @socket = TCPSocket.new(@host || @domain, @port)
-      log("Connected to #{@host || @domain}:#{@port}")
-
-      if @use_tls == :always
-        wrap_socket_with_tls
-      end
-
-      setup_parser
-      open_stream
-      features = wait_for_element(name: "stream:features", allow_reconnect: false)
-      @last_stream_features = features
-      @plugin_manager.on_stream_features(features)
-
-      if @use_tls == :starttls && features_supports_starttls?(features)
+      open_transport
+      open_and_negotiate_stream
+      if @use_tls == :starttls && features_supports_starttls?(@last_stream_features)
         start_tls
         setup_parser
-        open_stream
-        features = wait_for_element(name: "stream:features", allow_reconnect: false)
-        @last_stream_features = features
-        @plugin_manager.on_stream_features(features)
+        open_and_negotiate_stream
       end
       authenticate
-      open_stream
-      features = wait_for_element(name: "stream:features", allow_reconnect: false)
-      @last_stream_features = features
-      @plugin_manager.on_stream_features(features)
+      open_and_negotiate_stream
       bind_resource
       start_session
       mark_connected
+    end
+
+    # Establish the raw or TLS transport and the initial parser/socket state.
+    def open_transport
+      @socket = TCPSocket.new(@host || @domain, @port, connect_timeout: @connect_timeout)
+      log("Connected to #{@host || @domain}:#{@port}")
+      wrap_socket_with_tls if @use_tls == :always
+      setup_parser
+    end
+
+    # Send the stream header and wait for and record stream features. After
+    # STARTTLS the server re-issues features over the new TLS stream.
+    def open_and_negotiate_stream
+      open_stream
+      @last_stream_features = wait_for_element(name: "stream:features", allow_reconnect: false)
+      @plugin_manager.on_stream_features(@last_stream_features)
     end
 
     def cleanup_connection
@@ -233,34 +262,43 @@ module Xmpp
     end
 
     def features_supports_starttls?(features)
-      features.elements.any? { |element| element.name == "starttls" }
-    end
-
-    def wait_for_element(name:, allow_reconnect:)
-      names = Array(name)
-      loop do
-        element = next_element(allow_reconnect: allow_reconnect)
-        return element if names.any? { |n| element.expanded_name == n || element.name == n }
+      features.elements.any? do |element|
+        element.name == "starttls" && namespaced?(element, StartTlsNamespace)
       end
     end
 
-    def wait_for_iq(id, allow_reconnect:)
+    def wait_for_element(name:, allow_reconnect:, timeout: @read_timeout)
+      names = Array(name)
       loop do
-        element = next_element(allow_reconnect: allow_reconnect)
+        element = next_element(allow_reconnect: allow_reconnect, timeout: timeout)
+        raise TimeoutError, "Timed out after #{timeout}s waiting for element #{names.join('/')}" if element.nil?
+        return element if names.any? { |n| element_matches?(element, n) }
+      end
+    end
+
+    def wait_for_iq(id, allow_reconnect:, timeout: @read_timeout)
+      loop do
+        element = next_element(allow_reconnect: allow_reconnect, timeout: timeout)
+        raise TimeoutError, "Timed out after #{timeout}s waiting for IQ #{id}" if element.nil?
         next unless element.name == "iq"
         return element if element.attributes["id"] == id
       end
     end
 
-    def next_element(allow_reconnect:)
+    def next_element(allow_reconnect:, timeout: nil)
       loop do
-        event = @parser.next_event
-        if event.type == :element
+        event = @parser.next_event(timeout: timeout)
+        raise TimeoutError, "Timed out after #{timeout}s waiting for data from server" if event.nil?
+        case event.type
+        when :element
           log("<< #{event.element}") if @logger
           dispatch_incoming(event.element)
           return event.element
+        when :eof
+          handle_disconnect(::IOError.new("Connection closed by server"), allow_reconnect: allow_reconnect)
+        when :error
+          handle_disconnect(event.error, allow_reconnect: allow_reconnect)
         end
-        handle_disconnect(event.error, allow_reconnect: allow_reconnect)
       end
     end
 
@@ -268,6 +306,20 @@ module Xmpp
       loop do
         element = next_element(allow_reconnect: true)
         return element if %w[message presence iq].include?(element.name)
+      end
+    end
+
+    # Matches an element against a wait name. Namespaced stream elements
+    # ("stream:features", "stream:error") are matched by their effective
+    # namespace so prefix binding never causes a silent miss.
+    def element_matches?(element, name)
+      case name
+      when "stream:features"
+        namespaced?(element, StreamNamespace) && element.name == "features"
+      when "stream:error"
+        namespaced?(element, StreamNamespace) && element.name == "error"
+      else
+        element.name == name
       end
     end
 
@@ -303,25 +355,34 @@ module Xmpp
 
     def start_ping
       return unless @ping_interval && @ping_interval > 0
+      @ping_mutex = Mutex.new
+      @ping_cond = ConditionVariable.new
       @stop_ping = false
       @ping_thread = Thread.new do
         counter = 0
         loop do
-          sleep @ping_interval
-          break if @stop_ping
+          break if wait_for_next_ping
           counter += 1
           send_ping("ping_#{counter}")
-        rescue StandardError => e
-          log("Ping error: #{e}")
-          break
         end
+      rescue StandardError => e
+        log("Ping error: #{e}")
+      end
+    end
+
+    # Returns true when the ping loop should stop. Uses a condition variable
+    # so stop_ping can wake it promptly; the loop only checks the flag between
+    # pings so a ping write is never interrupted mid-stanza.
+    def wait_for_next_ping
+      @ping_mutex.synchronize do
+        @ping_cond.wait(@ping_mutex, @ping_interval) unless @stop_ping
+        @stop_ping
       end
     end
 
     def stop_ping
       @stop_ping = true
-      @ping_thread&.kill
-      @ping_thread = nil
+      @ping_cond&.signal
     end
 
     def send_ping(id)
@@ -332,13 +393,18 @@ module Xmpp
     def send_raw(xml)
       xml = @plugin_manager.before_send(xml)
       log(">> #{xml}")
-      @socket.write(xml)
+      @write_mutex.synchronize do
+        return unless @socket
+        @socket.write(xml)
+      end
     end
 
     def parse_jid(jid)
       parts = jid.split("@", 2)
-      raise "JID must be in user@domain format" if parts.length != 2
-      [parts[1], parts[0]]
+      raise ArgumentError, "JID must be in user@domain format" if parts.length != 2
+      user = parts[0].split("/", 2).first
+      domain = parts[1].split("/", 2).first
+      [domain, user]
     end
 
     def log(message)

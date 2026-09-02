@@ -40,7 +40,16 @@ class XmppStreamParser
     @io = io
     @queue = TimedQueue.new
     @logger = logger
+    @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     @thread = Thread.new { run }
+  end
+
+  # Monotonic timestamp of the last activity observed on the wire (any parsed
+  # element, EOF, or error). Used by the client's ping-based liveness check:
+  # this is recorded by the reader thread itself, so it advances even when no
+  # one is consuming events.
+  def last_activity
+    @last_activity
   end
 
   # Yields the next parse event. When +timeout+ (seconds) is given and
@@ -86,13 +95,13 @@ class XmppStreamParser
         return
       end
       element = @stack.pop
-      if @stack.empty?
-        return
-      end
+      return if @stack.empty?
       if @stack.length == 1
+        @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @queue << Event.new(:element, element, nil)
       end
     rescue StandardError => e
+      @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       @queue << Event.new(:error, nil, e)
       log("Parser end_element error: #{e}")
     end

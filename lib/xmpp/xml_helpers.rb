@@ -1,4 +1,10 @@
 module Xmpp
+  # Base class for errors raised by the client (timeouts, protocol
+  # failures, authentication problems).
+  class Error < StandardError; end
+end
+
+module Xmpp
   module XmlHelpers
     # The XML namespace used for the stream itself (RFC 6120).
     StreamNamespace = "http://etherx.jabber.org/streams"
@@ -49,7 +55,7 @@ module Xmpp
     end
 
     def raise_iq_error(iq, fallback)
-      raise iq_error_message(iq, fallback)
+      raise Xmpp::Error, iq_error_message(iq, fallback)
     end
 
     # Run each callback registered for +event+, isolating failures so a
@@ -58,11 +64,16 @@ module Xmpp
       Array(callbacks[event]).each do |cb|
         begin
           cb.call(payload)
-        rescue StandardError
+        rescue StandardError => e
           # per-callback isolation: a misbehaving listener must not
           # stop sibling listeners or the parser thread.
+          warn("XMPP plugin callback #{event} error: #{e.class}: #{e.message}")
         end
       end
+    end
+
+    def warn(message)
+      Kernel.warn(message)
     end
   end
 end

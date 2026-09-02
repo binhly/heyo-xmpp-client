@@ -13,10 +13,10 @@ require_relative "xml_helpers"
 module Xmpp
   class Client
     include Xmpp::XmlHelpers
-
     # Raised when a bounded wait (connect / IQ / element / read) times out
     # instead of blocking forever.
-    class TimeoutError < StandardError; end
+    TimeoutError = Class.new(Xmpp::Error)
+
 
     StreamHeader = %(<?xml version='1.0'?>\n<stream:stream to='%{domain}' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' version='1.0'>)
 
@@ -39,13 +39,11 @@ module Xmpp
       @reconnect_max_interval = reconnect_max_interval
       @ping_interval = ping_interval
       @ping_thread = nil
-      @ping_cond = nil
-      @ping_mutex = nil
-      @stop_ping = false
       @connect_timeout = connect_timeout
       @read_timeout = read_timeout
       @reconnect_mutex = Mutex.new
       @write_mutex = Mutex.new
+      @reconnecting = false
       @domain, @user = parse_jid(jid)
       @bare_jid = "#{@user}@#{@domain}"
       @full_jid = nil
@@ -144,12 +142,15 @@ module Xmpp
     end
 
     def open_stream
-      send_raw(StreamHeader % { domain: @domain })
+      send_raw(StreamHeader % { domain: escape_attr(@domain) })
     end
 
     def start_tls
-      send_raw("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
-      wait_for_element(name: "proceed", allow_reconnect: false)
+      send_raw("<starttls xmlns='#{StartTlsNamespace}'/>")
+      response = wait_for_element(name: ["proceed", "failure"], allow_reconnect: false)
+      if response.name == "failure"
+        raise Error, "STARTTLS negotiation failed: server sent <failure/>"
+      end
       stop_parser
       wrap_socket_with_tls
     end
@@ -172,26 +173,22 @@ module Xmpp
       plugin_result = @plugin_manager.sasl_authenticate(self, @last_stream_features)
       return if plugin_result == true
       # A plugin returned false because a token attempt failed (e.g. expired).
-      # Do NOT silently fall back to PLAIN over the same stream: the SASL
-      # exchange for the token was already consumed and most servers close the
-      # stream on auth failure. Reconnect so the stream is renegotiated fresh.
+      # Do NOT fall back to PLAIN over the same stream: the SASL exchange for
+      # the token was already consumed and most servers close the stream on
+      # auth failure. Restart the stream, then authenticate with PLAIN on it.
       if plugin_result == false
-        reconnect_for_auth_retry
+        raise Error, "Token auth rejected and password fallback disabled" if @plain_fallback_disabled
+        @plain_fallback_disabled = true
+        log("Token auth rejected; restarting stream for PLAIN retry")
+        cleanup_connection
+        open_transport
+        open_and_negotiate_stream
+        authenticate
         return
       end
       auth = Base64.strict_encode64("\0#{@user}\0#{@password}")
       response = sasl_authenticate(mechanism: "PLAIN", payload: auth)
-      raise "SASL authentication failed" if response.name == "failure"
-    end
-
-    def reconnect_for_auth_retry
-      log("Token auth rejected; restarting stream for PLAIN retry")
-      # Re-establish only the transport and the pre-auth stream. The caller
-      # (connect_once) continues with the post-auth stream and bind/session, so
-      # it must NOT do a full connect_once here (that would re-bind/re-session).
-      cleanup_connection
-      open_transport
-      open_and_negotiate_stream
+      raise Error, "SASL authentication failed" if response.name == "failure"
     end
 
     def bind_resource
@@ -209,6 +206,7 @@ module Xmpp
     end
 
     def connect_once
+      @plain_fallback_disabled = false
       cleanup_connection
       open_transport
       open_and_negotiate_stream
@@ -216,6 +214,12 @@ module Xmpp
         start_tls
         setup_parser
         open_and_negotiate_stream
+      elsif @use_tls == :starttls
+        # STARTTLS was requested but the server does not offer it; sending the
+        # password (even PLAIN-encoded) over cleartext TCP is never safe to do
+        # silently.
+        raise Error,
+              "STARTTLS required but not offered by server; refusing to authenticate over plaintext"
       end
       authenticate
       open_and_negotiate_stream
@@ -226,7 +230,9 @@ module Xmpp
 
     # Establish the raw or TLS transport and the initial parser/socket state.
     def open_transport
-      @socket = TCPSocket.new(@host || @domain, @port, connect_timeout: @connect_timeout)
+      # Socket.tcp supports connect_timeout on all supported Ruby versions;
+      # TCPSocket.new only gained the keyword in Ruby 3.4.
+      @socket = Socket.tcp(@host || @domain, @port, connect_timeout: @connect_timeout)
       log("Connected to #{@host || @domain}:#{@port}")
       wrap_socket_with_tls if @use_tls == :always
       setup_parser
@@ -329,60 +335,98 @@ module Xmpp
       reconnect_with_backoff(error)
     end
 
+    # Reconnects with exponential backoff. A re-entrancy flag prevents a
+    # nested reconnect attempt (e.g. an IQ sent from a plugin's on_connect
+    # hook failing while a reconnect is already in progress) from hitting a
+    # recursive-mutex deadlock: the inner call raises immediately and the
+    # outer loop simply retries.
     def reconnect_with_backoff(cause)
-      @reconnect_mutex.synchronize do
-        attempts = 0
-        interval = @reconnect_base_interval
-        loop do
-          attempts += 1
-          if @reconnect_max_attempts && attempts > @reconnect_max_attempts
-            raise(cause || "Reconnect attempts exceeded")
-          end
-          log("Reconnecting in #{interval}s")
-          sleep interval
-          begin
-            connect_once
-            start_ping
-            log("Reconnected")
-            return
-          rescue StandardError => e
-            log("Reconnect failed: #{e}")
-            interval = [interval * 2, @reconnect_max_interval].min
+      raise Error, "Reconnect already in progress" if @reconnecting
+      @reconnecting = true
+      begin
+        @reconnect_mutex.synchronize do
+          attempts = 0
+          interval = @reconnect_base_interval
+          loop do
+            attempts += 1
+            if @reconnect_max_attempts && attempts > @reconnect_max_attempts
+              raise(cause || "Reconnect attempts exceeded")
+            end
+            log("Reconnecting in #{interval}s")
+            sleep interval
+            begin
+              connect_once
+              start_ping
+              log("Reconnected")
+              return
+            rescue StandardError => e
+              log("Reconnect failed: #{e}")
+              interval = [interval * 2, @reconnect_max_interval].min
+            end
           end
         end
+      ensure
+        @reconnecting = false
       end
     end
 
+    # Liveness: the ping thread sends XEP-0199 pings and verifies that *any*
+    # server data arrives within a bounded window after each ping. If the
+    # connection is silently dead (half-open TCP, dropped NAT state), the
+    # next_element loop would otherwise block forever; the timeout check here
+    # forces an error and triggers the reconnect path.
     def start_ping
       return unless @ping_interval && @ping_interval > 0
-      @ping_mutex = Mutex.new
-      @ping_cond = ConditionVariable.new
-      @stop_ping = false
       @ping_thread = Thread.new do
         counter = 0
         loop do
-          break if wait_for_next_ping
+          sleep_interval = ping_interval_seconds
+          sleep sleep_interval
+          break unless @connected
           counter += 1
           send_ping("ping_#{counter}")
+          wait_for_liveness
         end
       rescue StandardError => e
         log("Ping error: #{e}")
       end
     end
 
-    # Returns true when the ping loop should stop. Uses a condition variable
-    # so stop_ping can wake it promptly; the loop only checks the flag between
-    # pings so a ping write is never interrupted mid-stanza.
-    def wait_for_next_ping
-      @ping_mutex.synchronize do
-        @ping_cond.wait(@ping_mutex, @ping_interval) unless @stop_ping
-        @stop_ping
+    def ping_interval_seconds
+      @ping_interval
+    end
+
+    # After a ping, the server must send *something* (the pong or any other
+    # stanza) within half the ping interval. The parser thread records the
+    # time of the last wire activity; if nothing arrived since the ping was
+    # sent, the connection is assumed dead. Closing the socket (rather than
+    # reconnecting here) makes the blocked parser read fail on the consumer
+    # thread, so the reconnect runs there exactly like any other drop.
+    def wait_for_liveness
+      sent_at = last_incoming_time
+      deadline = ping_interval_seconds / 2.0
+      slept = 0.0
+      step = 0.5
+      while slept < deadline
+        sleep step
+        slept += step
+        return if last_incoming_time > sent_at
+      end
+      log("No server data within #{deadline}s of ping; assuming dead connection")
+      mark_disconnected(error: ::IOError.new("Ping timeout: no response from server"))
+      @write_mutex.synchronize do
+        @socket&.close
+        @socket = nil
       end
     end
 
     def stop_ping
-      @stop_ping = true
-      @ping_cond&.signal
+      @ping_thread&.kill
+      @ping_thread = nil
+    end
+
+    def last_incoming_time
+      @parser&.last_activity
     end
 
     def send_ping(id)
@@ -394,7 +438,7 @@ module Xmpp
       xml = @plugin_manager.before_send(xml)
       log(">> #{xml}")
       @write_mutex.synchronize do
-        return unless @socket
+        raise Error, "Not connected" unless @socket
         @socket.write(xml)
       end
     end

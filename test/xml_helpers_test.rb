@@ -30,13 +30,13 @@ class XmlHelpersTest < Minitest::Test
 
   def test_raise_iq_error_uses_server_text
     doc = REXML::Document.new("<iq type='error'><error><text>Token expired</text></error></iq>")
-    err = assert_raises(RuntimeError) { @h.raise_iq_error(doc.root, "fallback") }
+    err = assert_raises(Xmpp::Error) { @h.raise_iq_error(doc.root, "fallback") }
     assert_equal "Token expired", err.message
   end
 
   def test_raise_iq_error_falls_back
     doc = REXML::Document.new("<iq type='error'/>")
-    err = assert_raises(RuntimeError) { @h.raise_iq_error(doc.root, "fallback msg") }
+    err = assert_raises(Xmpp::Error) { @h.raise_iq_error(doc.root, "fallback msg") }
     assert_equal "fallback msg", err.message
   end
 

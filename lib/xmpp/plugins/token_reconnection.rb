@@ -45,7 +45,7 @@ module Xmpp
         iq = @client.request_iq(id: id, xml: xml, allow_reconnect: true)
         raise_iq_error(iq, "Token request error") if iq.attributes["type"] == "error"
         items = child_by_name(iq, "items")
-        raise "Token response missing <items>" unless items
+        raise ProtocolError, "Token response missing <items>" unless items
         @access_token = child_text(items, "access_token")
         @refresh_token = child_text(items, "refresh_token")
         tokens

@@ -64,7 +64,7 @@ module Xmpp
       end
 
       def set_configuration(room_jid, **fields)
-        children = fields.map { |k, v| "<#{k}>#{escape_text(v)}</#{k}>" }.join
+        children = fields.map { |k, v| "<#{valid_config_key!(k)}>#{escape_text(v)}</#{k}>" }.join
         body = "<query xmlns='#{ConfigurationNs}'>#{children}</query>"
         send_iq(room_jid, "set", "muclight_set_config", body)
         true
@@ -153,6 +153,13 @@ module Xmpp
 
       private
 
+      # Configuration keys become XML tag names; reject anything that is
+      # not a simple element name before interpolating.
+      def valid_config_key!(key)
+        raise ArgumentError, "invalid MUC Light configuration key: #{key.inspect}" unless key.to_s.match?(/\A[a-z][a-z0-9_-]*\z/i)
+        key
+      end
+
       def client_domain
         @client.jid.to_s.split("@", 2).last
       end
@@ -180,7 +187,7 @@ module Xmpp
       def build_create_body(name, occupants, config)
         config_children = +"<roomname>#{escape_text(name)}</roomname>"
         config.each do |k, v|
-          config_children << "<#{k}>#{escape_text(v)}</#{k}>"
+          config_children << "<#{valid_config_key!(k)}>#{escape_text(v)}</#{k}>"
         end
         occupants_xml = if Array(occupants).empty?
           ""

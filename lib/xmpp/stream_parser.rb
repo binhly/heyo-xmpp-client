@@ -106,6 +106,8 @@ class XmppStreamParser
       log("Parser end_element error: #{e}")
     end
 
+    def xmldecl(_version, _encoding, _standalone); end
+
     def start_document; end
 
     def end_document; end
@@ -132,12 +134,66 @@ class XmppStreamParser
     end
   end
 
+  # REXML's IOSource requires #pos (and #seek) on the source IO to compute
+  # line numbers when a ParseException is formatted. OpenSSL::SSL::SSLSocket
+  # implements neither, so any parse error over TLS would surface as
+  # NoMethodError instead of the parse error. Wrap such IOs transparently.
+  class PosIO
+    def initialize(io)
+      @io = io
+    end
+
+    def read(*args)
+      @io.read(*args)
+    end
+
+    def pos
+      0
+    end
+
+    def lineno
+      0
+    end
+
+    # REXML calls this when formatting error context; a no-op is fine
+    # because the socket source cannot be rewound anyway.
+    def rewind; end
+
+    def seek(*)
+      0
+    end
+
+    def respond_to_missing?(name, include_private = false)
+      @io.respond_to?(name, include_private) || super
+    end
+
+    def method_missing(name, *args, **kwargs, &block)
+      if @io.respond_to?(name)
+        @io.public_send(name, *args, **kwargs, &block)
+      else
+        super
+      end
+    end
+  end
+
   def run
     listener = StreamListener.new(@queue, @logger)
-    parser = REXML::Parsers::SAX2Parser.new(@io)
+    source = @io.respond_to?(:pos) ? @io : PosIO.new(@io)
+    parser = REXML::Parsers::SAX2Parser.new(source)
     parser.listen(listener)
     parser.parse
     @queue << Event.new(:eof, nil, nil)
+  rescue REXML::ParseException => e
+    # The exception carries the source IO in its ivars (impossible to
+    # Marshal) and its #message can itself raise while it tries to read
+    # context from the (dead) socket. Never let the reader thread die
+    # before the error reaches the queue.
+    message = begin
+      "XML parse error: #{e.message}"
+    rescue StandardError
+      "XML parse error: malformed or truncated stream (#{e.class})"
+    end
+    @queue << Event.new(:error, nil, Xmpp::Error.new(message))
   rescue StandardError => e
     @queue << Event.new(:error, nil, e)
   end

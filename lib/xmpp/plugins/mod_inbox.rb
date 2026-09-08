@@ -18,7 +18,7 @@ module Xmpp
         iq = @client.request_iq(id: id, xml: xml, allow_reconnect: true)
         raise_iq_error(iq, "Inbox query error") if iq.attributes["type"] == "error"
         fin = child_by_name(iq, "fin")
-        raise "Inbox response missing <fin>" unless fin
+        raise ProtocolError, "Inbox response missing <fin>" unless fin
         {
           count: text_to_i(child_text(fin, "count")),
           unread_messages: text_to_i(child_text(fin, "unread-messages")),

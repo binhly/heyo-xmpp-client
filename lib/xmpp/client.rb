@@ -149,7 +149,7 @@ module Xmpp
       send_raw("<starttls xmlns='#{StartTlsNamespace}'/>")
       response = wait_for_element(name: ["proceed", "failure"], allow_reconnect: false)
       if response.name == "failure"
-        raise Error, "STARTTLS negotiation failed: server sent <failure/>"
+        raise ProtocolError, "STARTTLS negotiation failed: server sent <failure/>"
       end
       stop_parser
       wrap_socket_with_tls
@@ -177,18 +177,17 @@ module Xmpp
       # the token was already consumed and most servers close the stream on
       # auth failure. Restart the stream, then authenticate with PLAIN on it.
       if plugin_result == false
-        raise Error, "Token auth rejected and password fallback disabled" if @plain_fallback_disabled
+        raise AuthenticationError, "Token auth rejected and password fallback disabled" if @plain_fallback_disabled
         @plain_fallback_disabled = true
         log("Token auth rejected; restarting stream for PLAIN retry")
         cleanup_connection
-        open_transport
-        open_and_negotiate_stream
+        establish_secure_stream
         authenticate
         return
       end
       auth = Base64.strict_encode64("\0#{@user}\0#{@password}")
       response = sasl_authenticate(mechanism: "PLAIN", payload: auth)
-      raise Error, "SASL authentication failed" if response.name == "failure"
+      raise AuthenticationError.new("SASL authentication failed", failure_element: response) if response.name == "failure"
     end
 
     def bind_resource
@@ -196,7 +195,9 @@ module Xmpp
       send_raw(iq)
       response = wait_for_iq("bind_1", allow_reconnect: false)
       bind = response.elements["bind"]
-      @full_jid = bind&.elements["jid"]&.text
+      jid = bind&.elements["jid"]&.text
+      raise ProtocolError, "Malformed bind result: missing <bind><jid> in IQ response" unless jid
+      @full_jid = jid
     end
 
     def start_session
@@ -208,6 +209,20 @@ module Xmpp
     def connect_once
       @plain_fallback_disabled = false
       cleanup_connection
+      establish_secure_stream
+      authenticate
+      open_and_negotiate_stream
+      bind_resource
+      start_session
+      mark_connected
+    end
+
+    # Opens the transport, negotiates the stream and upgrades to TLS when
+    # requested and offered. Shared by connect_once and the token-auth
+    # PLAIN fallback: the fallback reconnects from scratch, so it must go
+    # through the same STARTTLS gate or it would send the password over
+    # plaintext TCP.
+    def establish_secure_stream
       open_transport
       open_and_negotiate_stream
       if @use_tls == :starttls && features_supports_starttls?(@last_stream_features)
@@ -218,21 +233,20 @@ module Xmpp
         # STARTTLS was requested but the server does not offer it; sending the
         # password (even PLAIN-encoded) over cleartext TCP is never safe to do
         # silently.
-        raise Error,
+        raise ProtocolError,
               "STARTTLS required but not offered by server; refusing to authenticate over plaintext"
       end
-      authenticate
-      open_and_negotiate_stream
-      bind_resource
-      start_session
-      mark_connected
     end
 
     # Establish the raw or TLS transport and the initial parser/socket state.
     def open_transport
       # Socket.tcp supports connect_timeout on all supported Ruby versions;
       # TCPSocket.new only gained the keyword in Ruby 3.4.
-      @socket = Socket.tcp(@host || @domain, @port, connect_timeout: @connect_timeout)
+      begin
+        @socket = Socket.tcp(@host || @domain, @port, connect_timeout: @connect_timeout)
+      rescue SystemCallError => e
+        raise Error, "Could not connect to #{@host || @domain}:#{@port}: #{e.class}: #{e.message}"
+      end
       log("Connected to #{@host || @domain}:#{@port}")
       wrap_socket_with_tls if @use_tls == :always
       setup_parser
@@ -399,9 +413,11 @@ module Xmpp
     # After a ping, the server must send *something* (the pong or any other
     # stanza) within half the ping interval. The parser thread records the
     # time of the last wire activity; if nothing arrived since the ping was
-    # sent, the connection is assumed dead. Closing the socket (rather than
-    # reconnecting here) makes the blocked parser read fail on the consumer
-    # thread, so the reconnect runs there exactly like any other drop.
+    # sent, the connection is assumed dead. Shutting the transport down
+    # (rather than reconnecting here) wakes the blocked parser read with
+    # EOF on the consumer thread, so the reconnect runs there exactly like
+    # any other drop. Note Socket#close does NOT interrupt a concurrent
+    # SSL_read — shutdown() does.
     def wait_for_liveness
       sent_at = last_incoming_time
       deadline = ping_interval_seconds / 2.0
@@ -415,8 +431,12 @@ module Xmpp
       log("No server data within #{deadline}s of ping; assuming dead connection")
       mark_disconnected(error: ::IOError.new("Ping timeout: no response from server"))
       @write_mutex.synchronize do
-        @socket&.close
-        @socket = nil
+        io = @socket.respond_to?(:to_io) ? @socket.to_io : @socket if @socket
+        begin
+          io&.shutdown
+        rescue StandardError
+          nil
+        end
       end
     end
 
@@ -441,6 +461,18 @@ module Xmpp
         raise Error, "Not connected" unless @socket
         @socket.write(xml)
       end
+    rescue SystemCallError, OpenSSL::SSL::SSLError, IOError => e
+      # A dead transport surfaces here as EPIPE/ECONNRESET/SSL write
+      # errors; normalize to the gem's error type so callers (plugins,
+      # request_iq) never see raw socket exceptions.
+      mark_disconnected(error: e)
+      if @reconnect && !@reconnecting
+        # Heal the transport the same way the read path does, then retry
+        # the write once on the fresh connection.
+        reconnect_with_backoff(e)
+        return send_raw(xml)
+      end
+      raise Error, "Write failed: #{e.class}: #{e.message}"
     end
 
     def parse_jid(jid)

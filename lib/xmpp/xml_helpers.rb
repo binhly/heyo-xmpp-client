@@ -2,6 +2,21 @@ module Xmpp
   # Base class for errors raised by the client (timeouts, protocol
   # failures, authentication problems).
   class Error < StandardError; end
+
+  # Raised when a SASL authentication exchange fails. Carries the server's
+  # <failure/> child element (e.g. <not-authorized/>) when available.
+  class AuthenticationError < Error
+    attr_reader :failure_element
+
+    def initialize(message, failure_element: nil)
+      @failure_element = failure_element
+      super(message)
+    end
+  end
+
+  # Raised when the server violates the protocol contract (duplicate stream
+  # header, malformed bind result, STARTTLS violations).
+  class ProtocolError < Error; end
 end
 
 module Xmpp
